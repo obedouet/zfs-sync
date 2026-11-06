@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily TrueNAS to OpenZFS snapshot sync
+
+[Timer]
+OnCalendar=*-*-* 02:30:00
+RandomizedDelaySec=30m
+Persistent=true
+Unit=zfs-sync.service
+
+[Install]
+WantedBy=timers.target

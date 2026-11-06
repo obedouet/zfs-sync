@@ -1,0 +1,60 @@
+# ---------------------------------------------------------------------------
+# zfs-sync configuration
+# ---------------------------------------------------------------------------
+# Install as /etc/zfs-sync.conf (chmod 0600).
+#
+
+[remote]
+# TrueNAS host to pull snapshots from.
+host = truenas.example.com
+port = 22
+user = root
+# Absolute path to the private key used to authenticate.
+identity_file = /root/.ssh/zfs-sync_ed25519
+# Prefix prepended to every `zfs` command that runs on TrueNAS.
+# TrueNAS SCALE: use "sudo -n" (grant NOPASSWD zfs rights to the sync user).
+# TrueNAS CORE : leave empty and use root, or an account with zfs permissions.
+command_prefix = sudo -n
+# "yes" enforces strict host key checking; set "no" for first run only.
+strict_host_key_checking = no
+# Connect timeout (seconds) for ssh itself.
+connect_timeout = 10
+
+[transfer]
+# Path to mbuffer. Set to empty string to disable the mbuffer stage.
+mbuffer = /usr/bin/mbuffer
+# mbuffer ring size (each of sender and receiver gets its own buffer).
+mbuffer_size = 256M
+# ssh compression. Usually useless on a LAN, harmful on slow links.
+compression = no
+# Per-dataset retry count if a send/receive stream breaks.
+retries = 2
+# Seconds to sleep between retries.
+retry_delay = 15
+
+[zfs]
+# Extra flags handed to `zfs receive` on the Linux side.
+#   -F  force rollback (required for incrementals that need one)
+#   -u  do not mount datasets created by the stream
+#   -s  (OpenZFS >= 0.7) enable resumable receive
+recv_flags = -Fs
+# Extra flags handed to `zfs send` on the TrueNAS side (full sends).
+full_send_flags =
+# Extra flags handed to `zfs send` on the TrueNAS side (incremental sends).
+incr_send_flags =
+# Replicate all children of the remote dataset as individual streams.
+include_children = no
+# Set a `zfs-sync:source=<remote-dataset>` property on local datasets
+# so the tool refuses to write a dataset that came from somewhere else.
+tag_local_source = yes
+# Persist ZFS resume tokens so an interrupted receive can continue.
+use_resume_token = yes
+# Where resume tokens and per-dataset status are stored.
+state_dir = /var/lib/zfs-sync
+
+[mappings]
+# <local-dataset> = <remote-dataset>
+# Local dataset must live in a pool that already exists on the Linux box.
+tank-10-0/vm1    = tank/vmimages
+tank-10-0/db     = tank/databases
+tank-10-0/media  = tank/media

@@ -1,0 +1,262 @@
+#!/usr/bin/env python3
+"""Fake zfs for zfs-sync simulation tests. State lives in FAKE_ZFS_STORE JSON."""
+import base64
+import json
+import os
+import sys
+
+STORE = os.environ.get("FAKE_ZFS_STORE", "/tmp/kilo/fake-zfs/store.json")
+
+
+def load():
+    try:
+        with open(STORE) as fh:
+            return json.load(fh)
+    except FileNotFoundError:
+        return {"datasets": {}, "resume_tokens": {}}
+
+
+def save(store):
+    tmp = STORE + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(store, fh, indent=2, sort_keys=True)
+    os.replace(tmp, STORE)
+
+
+def die(msg, rc=1):
+    sys.stderr.write(f"zfs: {msg}\n")
+    sys.exit(rc)
+
+
+def parse_flags(args, value_flags):
+    flags, positional = [], []
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in value_flags and i + 1 < len(args):
+            flags.append((arg, args[i + 1]))
+            i += 2
+        elif arg.startswith("-"):
+            flags.append((arg, None))
+            i += 1
+        else:
+            positional.append(arg)
+            i += 1
+    return flags, positional
+
+
+def get_snaps(store, name):
+    return store["datasets"][name]["snaps"]
+
+
+def cmd_list(rest):
+    store = load()
+    flags, positional = parse_flags(rest, {"-t", "-d", "-s", "-o"})
+    if not positional:
+        return
+    name = positional[0]
+    dsets = store.get("datasets", {})
+    types = {k: v for k, v in flags if v is not None}
+    if name not in dsets:
+        die(f"cannot open '{name}': dataset does not exist")
+    if types.get("-t") == "snapshot":
+        for snap in sorted(get_snaps(store, name), key=lambda s: s["creation"]):
+            print(f"{name}@{snap['name']}")
+    elif types.get("-t") == "filesystem":
+        found = False
+        for candidate in sorted(dsets):
+            if candidate == name or candidate.startswith(name + "/"):
+                print(candidate)
+                found = True
+        if not found:
+            die(f"cannot open '{name}': dataset does not exist")
+    else:
+        print(name)
+
+
+def cmd_snapshot(rest):
+    store = load()
+    target = next((arg for arg in rest if not arg.startswith("-")), None)
+    if not target or "@" not in target:
+        die("invalid snapshot name")
+    ds, snap = target.split("@", 1)
+    if ds not in store.get("datasets", {}):
+        die(f"cannot open '{ds}': dataset does not exist")
+    snaps = get_snaps(store, ds)
+    if any(s["name"] == snap for s in snaps):
+        die(f"cannot snapshot '{target}': already exists")
+    content = snaps[-1]["content"] if snaps else ""
+    snaps.append({"name": snap, "creation": max((s["creation"] for s in snaps), default=0) + 1, "content": content})
+    save(store)
+
+
+def cmd_get(rest):
+    store = load()
+    _, positional = parse_flags(rest, {"-o"})
+    if len(positional) != 2:
+        die("invalid get arguments")
+    prop, name = positional
+    dsets = store.get("datasets", {})
+    if name not in dsets:
+        die(f"cannot open '{name}': dataset does not exist")
+    if prop == "receive_resume_token":
+        token = store.get("resume_tokens", {}).get(name)
+        print(token if token else "-")
+        return
+    value = dsets[name].get("props", {}).get(prop)
+    if value is None:
+        die(f"property '{prop}' not defined on '{name}'")
+    print(value)
+
+
+def cmd_set(rest):
+    store = load()
+    _, positional = parse_flags(rest, set())
+    if len(positional) != 2 or "=" not in positional[0]:
+        die("invalid set arguments")
+    key, value = positional[0].split("=", 1)
+    name = positional[1]
+    if name not in store.get("datasets", {}):
+        die(f"cannot open '{name}': dataset does not exist")
+    store["datasets"][name].setdefault("props", {})[key] = value
+    save(store)
+
+
+def cmd_create(rest):
+    store = load()
+    _, positional = parse_flags(rest, set())
+    if not positional:
+        die("missing dataset name")
+    name = positional[0]
+    if name in store.get("datasets", {}):
+        die(f"cannot create '{name}': dataset already exists")
+    store["datasets"][name] = {"snaps": [], "props": {}}
+    save(store)
+
+
+def emit(spec, content):
+    print("HDR " + base64.b64encode(json.dumps(spec, sort_keys=True).encode()).decode())
+    print("DATA " + base64.b64encode(content.encode()).decode())
+    print("END")
+
+
+def cmd_send(rest):
+    store = load()
+    flags, positional = parse_flags(rest, {"-i", "-t"})
+    values = {k: v for k, v in flags if v is not None}
+    if "-t" in values:
+        try:
+            spec = json.loads(base64.b64decode(values["-t"]))
+        except Exception:
+            die("invalid resume token")
+        if spec.get("kind") == "resume":
+            die("invalid resume token")
+        dsets = store.get("datasets", {})
+        if spec["ds"] not in dsets:
+            die(f"cannot open '{spec['ds']}': dataset does not exist")
+        snap = next((s for s in get_snaps(store, spec["ds"]) if s["name"] == spec["snap"]), None)
+        if snap is None:
+            die(f"cannot open '{spec['ds']}@{spec['snap']}': no such snapshot")
+        spec["kind"] = "resume"
+        emit(spec, snap["content"])
+        return
+    if not positional:
+        die("missing snapshot")
+    target = positional[0]
+    if "@" not in target:
+        die(f"cannot send '{target}': not a snapshot")
+    ds, snap_name = target.split("@", 1)
+    if ds not in store.get("datasets", {}):
+        die(f"cannot open '{ds}': dataset does not exist")
+    snap = next((s for s in get_snaps(store, ds) if s["name"] == snap_name), None)
+    if snap is None:
+        die(f"cannot open '{target}': no such snapshot")
+    base = None
+    if "-i" in values:
+        base_arg = values["-i"]
+        if base_arg.startswith(ds + "@"):
+            base = base_arg[len(ds) + 1:]
+        elif "@" in base_arg:
+            base = base_arg.split("@", 1)[1]
+        else:
+            base = base_arg
+        if not any(s["name"] == base for s in get_snaps(store, ds)):
+            die(f"cannot open '{ds}@{base}': no such snapshot")
+    kind = "full" if base is None else "incr"
+    emit({"ds": ds, "snap": snap_name, "base": base, "kind": kind}, snap["content"])
+
+
+def cmd_receive(rest):
+    store = load()
+    flags, positional = parse_flags(rest, {"-x"})
+    if not positional:
+        die("missing destination")
+    dest = positional[0]
+    force = any(name.startswith("-") and "F" in name[1:] for name, _ in flags)
+    lines = sys.stdin.read().splitlines()
+    hdr = next((line for line in lines if line.startswith("HDR ")), None)
+    data_line = next((line for line in lines if line.startswith("DATA ")), "DATA ")
+    if hdr is None:
+        die("invalid backup stream")
+    try:
+        spec = json.loads(base64.b64decode(hdr[4:]))
+    except Exception:
+        die("invalid backup stream")
+    content = base64.b64decode(data_line[5:]).decode()
+    dsets = store.setdefault("datasets", {})
+    tokens = store.setdefault("resume_tokens", {})
+    if spec["kind"] == "resume":
+        pending = tokens.get(dest)
+        if not pending:
+            die(f"cannot resume receive into '{dest}': no interrupted receive")
+        expected = json.loads(base64.b64decode(pending))
+        if (expected["ds"], expected["snap"], expected["base"]) != (spec["ds"], spec["snap"], spec["base"]):
+            die(f"cannot resume receive into '{dest}': token mismatch")
+    elif dest in tokens:
+        die(f"cannot receive new stream into '{dest}': interrupted receive pending")
+    if store.get("interrupt") == spec["snap"]:
+        store.pop("interrupt")
+        tokens[dest] = hdr[4:]
+        save(store)
+        die(f"receive of '{dest}@{spec['snap']}' interrupted")
+    if spec["kind"] == "full":
+        if dest in dsets and get_snaps(store, dest):
+            if not force:
+                die(f"cannot receive full stream into '{dest}': destination exists")
+            dsets[dest]["snaps"] = []
+    if spec["kind"] == "incr":
+        if dest not in dsets:
+            die(f"cannot receive incremental stream into '{dest}': destination does not exist")
+        if not any(s["name"] == spec["base"] for s in get_snaps(store, dest)):
+            die(f"cannot receive incremental stream into '{dest}': incremental source does not match destination")
+    dsets.setdefault(dest, {"snaps": [], "props": {}})
+    snaps = dsets[dest]["snaps"]
+    if any(s["name"] == spec["snap"] for s in snaps):
+        die(f"cannot receive '{dest}@{spec['snap']}': snapshot already exists")
+    snaps.append({"name": spec["snap"], "creation": max((s["creation"] for s in snaps), default=0) + 1, "content": content})
+    tokens.pop(dest, None)
+    save(store)
+
+
+HANDLERS = {
+    "list": cmd_list,
+    "snapshot": cmd_snapshot,
+    "get": cmd_get,
+    "set": cmd_set,
+    "create": cmd_create,
+    "send": cmd_send,
+    "receive": cmd_receive,
+}
+
+
+def main():
+    args = sys.argv[1:]
+    if not args:
+        die("missing command", 2)
+    handler = HANDLERS.get(args[0])
+    if handler is None:
+        die(f"invalid command '{args[0]}'", 2)
+    handler(args[1:])
+
+
+main()

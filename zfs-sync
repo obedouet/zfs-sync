@@ -1,0 +1,545 @@
+#!/usr/bin/env python3
+
+"""zfs-sync: pull ZFS snapshots from a TrueNAS appliance into a Linux OpenZFS host.
+
+Runs on the Linux side. For every mapped dataset it compares local and remote
+snapshot lists, then streams the missing snapshots over SSH using
+`zfs send | mbuffer` on TrueNAS piped into `mbuffer | zfs receive` locally.
+
+- dataset missing locally      -> full send of the oldest snapshot, then an
+                                  incremental chain for every later snapshot.
+- dataset present locally      -> incremental sends (-i) from the newest
+                                  common snapshot to every newer remote one.
+- interrupted receives         -> resumed with `zfs send -t <resume token>`.
+"""
+
+from __future__ import annotations
+
+import argparse
+import configparser
+import errno
+import fcntl
+import json
+import logging
+import re
+import shlex
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+__version__ = "1.0.0"
+DEFAULT_CONFIG = "/etc/zfs-sync.conf"
+SOURCE_PROPERTY = "zfs-sync:source"
+RESUME_PROPERTY = "receive_resume_token"
+LOCK_NAME = ".lock"
+
+TRUE_VALUES = {"yes", "true", "1", "on"}
+FALSE_VALUES = {"no", "false", "0", "off", ""}
+DATASET_RE = re.compile(r"^[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*$")
+RESERVED_COMPONENTS = {".", "..", ".zfs"}
+
+log = logging.getLogger("zfs-sync")
+
+
+class ConfigError(Exception):
+    pass
+
+
+class ZfsError(Exception):
+    pass
+
+
+class Config:
+    def __init__(self) -> None:
+        self.host = ""
+        self.port = 22
+        self.user = "root"
+        self.identity_file = ""
+        self.command_prefix = ""
+        self.strict_host_key_checking = False
+        self.connect_timeout = 10
+
+        self.mbuffer = "/usr/bin/mbuffer"
+        self.mbuffer_size = "256M"
+        self.compression = False
+        self.retries = 0
+        self.retry_delay = 15
+
+        self.recv_flags = ["-Fsu"]
+        self.full_send_flags: list[str] = []
+        self.incr_send_flags: list[str] = []
+        self.include_children = False
+        self.tag_local_source = True
+        self.use_resume_token = True
+        self.state_dir = "/var/lib/zfs-sync"
+
+        self.mappings: dict[str, str] = {}
+
+
+def _as_bool(section: str, key: str, raw: str | None, default: bool) -> bool:
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in TRUE_VALUES:
+        return True
+    if value in FALSE_VALUES:
+        return False
+    raise ConfigError(f"[{section}] {key}={raw!r} is not a boolean")
+
+
+def _as_int(section: str, key: str, raw: str | None, default: int, minimum: int = 0) -> int:
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        raise ConfigError(f"[{section}] {key}={raw!r} is not an integer") from None
+    if value < minimum:
+        raise ConfigError(f"[{section}] {key}={raw!r} must be >= {minimum}")
+    return value
+
+
+def _as_flags(section: str, key: str, raw: str | None) -> list[str]:
+    if not raw or not raw.strip():
+        return []
+    flags = shlex.split(raw)
+    for flag in flags:
+        if not flag.startswith("-"):
+            raise ConfigError(f"[{section}] {key}={raw!r}: {flag!r} does not look like a flag")
+    return flags
+
+
+def _validate_dataset(name: str, label: str) -> str:
+    name = name.strip()
+    if not DATASET_RE.match(name):
+        raise ConfigError(f"invalid {label} dataset name: {name!r}")
+    if any(component in RESERVED_COMPONENTS for component in name.split("/")):
+        raise ConfigError(f"invalid {label} dataset name: {name!r}")
+    return name
+
+
+def load_config(path: str) -> Config:
+    parser = configparser.ConfigParser(interpolation=None)
+    parser.optionxform = str
+    if not parser.read([path]):
+        raise ConfigError(f"configuration file not found: {path}")
+
+    cfg = Config()
+
+    def warn_unknown(section: str, items: dict[str, str]) -> None:
+        for key in items:
+            log.warning("unknown option [%s] %s", section, key)
+
+    if not parser.has_section("mappings"):
+        raise ConfigError("configuration is missing the [mappings] section")
+
+    items = dict(parser["remote"]) if parser.has_section("remote") else {}
+    cfg.host = items.pop("host", "").strip()
+    cfg.port = _as_int("remote", "port", items.pop("port", None), 22)
+    cfg.user = items.pop("user", "root").strip() or "root"
+    cfg.identity_file = items.pop("identity_file", "").strip()
+    cfg.command_prefix = items.pop("command_prefix", "").strip()
+    cfg.strict_host_key_checking = _as_bool(
+        "remote", "strict_host_key_checking", items.pop("strict_host_key_checking", None), False
+    )
+    cfg.connect_timeout = _as_int("remote", "connect_timeout", items.pop("connect_timeout", None), 10)
+    warn_unknown("remote", items)
+    if not cfg.host:
+        raise ConfigError("[remote] host is required")
+
+    items = dict(parser["transfer"]) if parser.has_section("transfer") else {}
+    cfg.mbuffer = items.pop("mbuffer", "/usr/bin/mbuffer").strip()
+    cfg.mbuffer_size = items.pop("mbuffer_size", "256M").strip() or "256M"
+    cfg.compression = _as_bool("transfer", "compression", items.pop("compression", None), False)
+    cfg.retries = _as_int("transfer", "retries", items.pop("retries", None), 0)
+    cfg.retry_delay = _as_int("transfer", "retry_delay", items.pop("retry_delay", None), 15)
+    warn_unknown("transfer", items)
+    if cfg.mbuffer and not re.match(r"^\d+[KMGTP]?$", cfg.mbuffer_size, re.IGNORECASE):
+        raise ConfigError(f"[transfer] mbuffer_size={cfg.mbuffer_size!r} is not a valid size")
+
+    items = dict(parser["zfs"]) if parser.has_section("zfs") else {}
+    cfg.recv_flags = _as_flags("zfs", "recv_flags", items.pop("recv_flags", "-Fsu"))
+    cfg.full_send_flags = _as_flags("zfs", "full_send_flags", items.pop("full_send_flags", None))
+    cfg.incr_send_flags = _as_flags("zfs", "incr_send_flags", items.pop("incr_send_flags", None))
+    cfg.include_children = _as_bool("zfs", "include_children", items.pop("include_children", None), False)
+    cfg.tag_local_source = _as_bool("zfs", "tag_local_source", items.pop("tag_local_source", None), True)
+    cfg.use_resume_token = _as_bool("zfs", "use_resume_token", items.pop("use_resume_token", None), True)
+    cfg.state_dir = items.pop("state_dir", "/var/lib/zfs-sync").strip() or "/var/lib/zfs-sync"
+    warn_unknown("zfs", items)
+
+    for local, remote in parser["mappings"].items():
+        local = _validate_dataset(local, "local")
+        remote = _validate_dataset(remote, "remote")
+        if local in cfg.mappings:
+            raise ConfigError(f"duplicate mapping for local dataset {local!r}")
+        if local == remote:
+            raise ConfigError(f"local and remote dataset must differ: {local!r}")
+        cfg.mappings[local] = remote
+    if not cfg.mappings:
+        raise ConfigError("[mappings] does not contain any mapping")
+
+    return cfg
+
+
+def build_ssh_argv(cfg: Config, remote_command: str) -> list[str]:
+    argv = [
+        "ssh",
+        "-p", str(cfg.port),
+        "-o", f"ConnectTimeout={cfg.connect_timeout}",
+        "-o", "BatchMode=yes",
+        "-o", "ServerAliveInterval=30",
+        "-o", "ServerAliveCountMax=20",
+        "-o", f"StrictHostKeyChecking={'yes' if cfg.strict_host_key_checking else 'no'}",
+    ]
+    if cfg.identity_file:
+        argv += ["-i", cfg.identity_file]
+    if cfg.compression:
+        argv.append("-C")
+    argv += [f"{cfg.user}@{cfg.host}", remote_command]
+    return argv
+
+
+def remote_zfs_command(cfg: Config, zfs_args: list[str]) -> str:
+    command = shlex.join(["zfs", *[str(arg) for arg in zfs_args]])
+    if cfg.command_prefix:
+        command = f"{cfg.command_prefix} {command}"
+    return command
+
+
+def remote_pipeline(cfg: Config, send_args: list[str]) -> str:
+    command = remote_zfs_command(cfg, send_args)
+    if cfg.mbuffer:
+        command += f" | {shlex.quote(cfg.mbuffer)} -m {cfg.mbuffer_size} -q"
+    return command
+
+
+def plan_streams(local_snaps: list[str], remote_snaps: list[str]) -> list[tuple]:
+    """Return the send operations needed to bring local up to remote.
+
+    Both arguments are snapshot basenames ordered oldest -> newest.
+    Entries are ("full", snap) or ("incr", base, snap).
+    """
+    if not remote_snaps:
+        return []
+    if not local_snaps:
+        plan: list[tuple] = [("full", remote_snaps[0])]
+        for index, snap in enumerate(remote_snaps[1:], start=1):
+            plan.append(("incr", remote_snaps[index - 1], snap))
+        return plan
+    local_set = set(local_snaps)
+    common = [snap for snap in remote_snaps if snap in local_set]
+    if not common:
+        return [("full", remote_snaps[-1])]
+    base = common[-1]
+    new_snaps = remote_snaps[remote_snaps.index(base) + 1:]
+    plan = []
+    previous = base
+    for snap in new_snaps:
+        plan.append(("incr", previous, snap))
+        previous = snap
+    return plan
+
+
+def _run(argv: list[str]) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(argv, capture_output=True, text=True)
+    except FileNotFoundError:
+        raise ZfsError(f"command not found: {argv[0]}") from None
+
+
+def run_local_zfs(*args: str) -> subprocess.CompletedProcess:
+    return _run(["zfs", *[str(arg) for arg in args]])
+
+
+def run_remote_zfs(cfg: Config, *args: str) -> subprocess.CompletedProcess:
+    return _run(build_ssh_argv(cfg, remote_zfs_command(cfg, list(args))))
+
+
+def dataset_exists_local(name: str) -> bool:
+    result = run_local_zfs("list", "-H", "-o", "name", name)
+    return result.returncode == 0 and result.stdout.strip() == name
+
+
+def dataset_exists_remote(cfg: Config, name: str) -> bool:
+    result = run_remote_zfs(cfg, "list", "-H", "-o", "name", name)
+    return result.returncode == 0 and result.stdout.strip() == name
+
+
+def _parse_snapshot_names(output: str, dataset: str) -> list[str]:
+    prefix = dataset + "@"
+    names = []
+    for line in output.splitlines():
+        line = line.strip()
+        if line.startswith(prefix):
+            names.append(line[len(prefix):])
+    return names
+
+
+def list_snapshot_names_local(dataset: str) -> list[str]:
+    result = run_local_zfs("list", "-H", "-t", "snapshot", "-d", "1", "-s", "creation", "-o", "name", dataset)
+    if result.returncode != 0:
+        raise ZfsError(f"cannot list local snapshots of {dataset}: {result.stderr.strip()}")
+    return _parse_snapshot_names(result.stdout, dataset)
+
+
+def list_snapshot_names_remote(cfg: Config, dataset: str) -> list[str]:
+    result = run_remote_zfs(cfg, "list", "-H", "-t", "snapshot", "-d", "1", "-s", "creation", "-o", "name", dataset)
+    if result.returncode != 0:
+        raise ZfsError(f"cannot list remote snapshots of {dataset}: {result.stderr.strip()}")
+    return _parse_snapshot_names(result.stdout, dataset)
+
+
+def list_child_datasets_remote(cfg: Config, dataset: str) -> list[str]:
+    result = run_remote_zfs(cfg, "list", "-H", "-t", "filesystem", "-r", "-d", "10", "-o", "name", dataset)
+    if result.returncode != 0:
+        raise ZfsError(f"cannot list children of {dataset}: {result.stderr.strip()}")
+    prefix = dataset + "/"
+    return [name for name in result.stdout.splitlines() if name.startswith(prefix)]
+
+
+def zfs_get_prop_local(prop: str, dataset: str) -> tuple[int, str]:
+    result = run_local_zfs("get", "-H", "-o", "value", prop, dataset)
+    return result.returncode, result.stdout.strip()
+
+
+def _stream_send(cfg: Config, send_args: list[str], dest: str) -> int:
+    ssh_proc = subprocess.Popen(
+        build_ssh_argv(cfg, remote_pipeline(cfg, send_args)), stdout=subprocess.PIPE
+    )
+    chain = [ssh_proc]
+    feed = ssh_proc.stdout
+
+    if cfg.mbuffer:
+        mbuffer_proc = subprocess.Popen(
+            [cfg.mbuffer, "-m", cfg.mbuffer_size, "-q"], stdin=feed, stdout=subprocess.PIPE
+        )
+        feed.close()
+        chain.append(mbuffer_proc)
+        feed = mbuffer_proc.stdout
+
+    recv_proc = subprocess.Popen(["zfs", "receive", *cfg.recv_flags, dest], stdin=feed)
+    feed.close()
+    chain.append(recv_proc)
+
+    receive_rc = recv_proc.wait()
+    for proc in chain[:-1]:
+        proc.wait()
+    if receive_rc != 0:
+        return receive_rc
+    for proc in chain[:-1]:
+        if proc.returncode != 0:
+            return proc.returncode
+    return 0
+
+
+class SyncEngine:
+    def __init__(self, cfg: Config, dry_run: bool = False) -> None:
+        self.cfg = cfg
+        self.dry_run = dry_run
+        self.state_dir = Path(cfg.state_dir)
+        self.results: list[dict] = []
+
+    def _record(self, local: str, remote: str, result: str, snapshot: str | None, detail: str) -> str:
+        entry = {
+            "local": local,
+            "remote": remote,
+            "result": result,
+            "snapshot": snapshot,
+            "detail": detail,
+            "run_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        }
+        self.results.append(entry)
+        self._write_status(entry)
+        return result
+
+    def _write_status(self, entry: dict) -> None:
+        if self.dry_run:
+            return
+        try:
+            self.state_dir.mkdir(parents=True, exist_ok=True)
+            path = self.state_dir / (entry["local"].replace("/", "__") + ".json")
+            path.write_text(json.dumps(entry, indent=2) + "\n")
+        except OSError as exc:
+            log.warning("cannot write status file for %s: %s", entry["local"], exc)
+
+    def _log_dry_run(self, send_args: list[str], dest: str) -> None:
+        recv_command = shlex.join(["zfs", "receive", *self.cfg.recv_flags, dest])
+        local_stage = recv_command
+        if self.cfg.mbuffer:
+            local_stage = f"{shlex.quote(self.cfg.mbuffer)} -m {self.cfg.mbuffer_size} -q | {recv_command}"
+        log.info("[dry-run] remote: %s", remote_pipeline(self.cfg, send_args))
+        log.info("[dry-run] local:  %s", local_stage)
+
+    def _stream_with_retries(self, send_args: list[str], dest: str, label: str) -> bool:
+        if self.dry_run:
+            self._log_dry_run(send_args, dest)
+            return True
+        attempts = self.cfg.retries + 1
+        for attempt in range(1, attempts + 1):
+            rc = _stream_send(self.cfg, send_args, dest)
+            if rc == 0:
+                return True
+            log.error("%s: stream failed (exit %d), attempt %d/%d", dest, rc, attempt, attempts)
+            if attempt < attempts:
+                time.sleep(self.cfg.retry_delay)
+        return False
+
+    def sync_dataset(self, local: str, remote: str, batch: set[str]) -> str:
+        cfg = self.cfg
+        log.info("checking %s <- %s", local, remote)
+
+        if not dataset_exists_remote(cfg, remote):
+            return self._record(local, remote, "error", None, "remote dataset does not exist")
+
+        local_exists = dataset_exists_local(local)
+        if not local_exists and "/" in local:
+            parent = local.rsplit("/", 1)[0]
+            if parent not in batch and not dataset_exists_local(parent):
+                return self._record(local, remote, "error", None, f"local parent {parent!r} does not exist")
+
+        if local_exists:
+            rc, tag = zfs_get_prop_local(SOURCE_PROPERTY, local)
+            if rc == 0 and tag and tag != remote:
+                return self._record(
+                    local, remote, "error", None,
+                    f"local dataset is tagged with a different source ({tag!r})",
+                )
+
+        if local_exists and cfg.use_resume_token:
+            rc, token = zfs_get_prop_local(RESUME_PROPERTY, local)
+            if rc == 0 and token and token != "-":
+                log.warning("%s: resuming interrupted receive", local)
+                if not self._stream_with_retries(["send", "-t", token], local, "resume"):
+                    return self._record(local, remote, "error", None, "receive resume failed")
+
+        local_snaps = list_snapshot_names_local(local) if local_exists else []
+        remote_snaps = list_snapshot_names_remote(cfg, remote)
+        if not remote_snaps:
+            return self._record(local, remote, "skip", None, "no remote snapshots")
+
+        plan = plan_streams(local_snaps, remote_snaps)
+        if not plan:
+            return self._record(local, remote, "ok", remote_snaps[-1], "up to date")
+
+        if local_snaps and set(local_snaps).isdisjoint(remote_snaps):
+            log.warning(
+                "%s: no common snapshot found; full send of %s@%s will roll back local history",
+                local, remote, plan[0][1],
+            )
+
+        for entry in plan:
+            if entry[0] == "full":
+                label = f"full {remote}@{entry[1]}"
+                send_args = ["send", *cfg.full_send_flags, f"{remote}@{entry[1]}"]
+            else:
+                label = f"incremental {remote}@{entry[1]} -> {remote}@{entry[2]}"
+                send_args = ["send", *cfg.incr_send_flags,
+                             "-i", f"{remote}@{entry[1]}", f"{remote}@{entry[2]}"]
+            log.info("%s: sending %s", local, label)
+            if not self._stream_with_retries(send_args, local, label):
+                return self._record(local, remote, "error", None, f"stream failed: {label}")
+
+        if cfg.tag_local_source:
+            rc, tag = zfs_get_prop_local(SOURCE_PROPERTY, local)
+            if rc != 0 or tag != remote:
+                result = run_local_zfs("set", f"{SOURCE_PROPERTY}={remote}", local)
+                if result.returncode != 0:
+                    log.warning("cannot tag %s: %s", local, result.stderr.strip())
+
+        return self._record(local, remote, "ok", remote_snaps[-1], f"{len(plan)} stream(s) sent")
+
+    def sync_mapping(self, local: str, remote: str) -> None:
+        pairs = [(local, remote)]
+        if self.cfg.include_children:
+            for child in list_child_datasets_remote(self.cfg, remote):
+                pairs.append((local + child[len(remote):], child))
+        batch = {name for name, _ in pairs}
+        for child_local, child_remote in pairs:
+            self.sync_dataset(child_local, child_remote, batch)
+
+
+def acquire_lock(state_dir: str):
+    path = Path(state_dir) / LOCK_NAME
+    try:
+        handle = open(path, "w")
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        if exc.errno in (errno.EAGAIN, errno.EACCES):
+            log.error("another zfs-sync run is already active")
+        else:
+            log.warning("cannot use lock file %s: %s", path, exc)
+        return None
+    return handle
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="zfs-sync",
+        description="Pull ZFS snapshots from a TrueNAS appliance into local OpenZFS pools.",
+    )
+    parser.add_argument("-c", "--config", default=DEFAULT_CONFIG,
+                        help=f"configuration file (default: {DEFAULT_CONFIG})")
+    parser.add_argument("-n", "--dry-run", action="store_true",
+                        help="show the planned sends and receives without transferring data")
+    parser.add_argument("-v", "--verbose", action="store_true", help="verbose logging")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    parser.add_argument("datasets", nargs="*",
+                        help="optional list of local dataset names to restrict the run to")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s %(levelname)-7s %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S",
+        stream=sys.stderr,
+    )
+
+    try:
+        cfg = load_config(args.config)
+    except ConfigError as exc:
+        log.error("configuration error: %s", exc)
+        return 2
+
+    selected = cfg.mappings
+    if args.datasets:
+        unknown = [name for name in args.datasets if name not in cfg.mappings]
+        if unknown:
+            log.error("no mapping for: %s", ", ".join(unknown))
+            return 2
+        selected = {name: cfg.mappings[name] for name in args.datasets}
+
+    log.info("zfs-sync %s, config=%s, remote=%s@%s:%d", __version__, args.config, cfg.user, cfg.host, cfg.port)
+
+    lock = None
+    if not args.dry_run:
+        try:
+            Path(cfg.state_dir).mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            log.warning("cannot create state dir %s: %s", cfg.state_dir, exc)
+        lock = acquire_lock(cfg.state_dir)
+        if lock is None:
+            return 3
+
+    engine = SyncEngine(cfg, dry_run=args.dry_run)
+    try:
+        for local, remote in selected.items():
+            engine.sync_mapping(local, remote)
+    except ZfsError as exc:
+        log.error("%s", exc)
+        return 2
+
+    log.info("summary:")
+    for entry in engine.results:
+        log.info("  %-6s %-30s %s", entry["result"], entry["local"], entry["detail"])
+
+    failed = [entry for entry in engine.results if entry["result"] == "error"]
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

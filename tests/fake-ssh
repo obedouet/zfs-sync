@@ -1,0 +1,6 @@
+#!/usr/bin/env python3
+"""Fake ssh for zfs-sync simulation: runs the remote command locally via sh."""
+import subprocess
+import sys
+
+sys.exit(subprocess.run(["/bin/sh", "-c", sys.argv[-1]]).returncode)
